@@ -28,6 +28,17 @@ from app.features.attacker_responses import (
     get_fake_secret_list,
     utc_now_iso,
 )
+from app.features.ip_blocking import (
+    init_blocklist_table,
+    add_ip_block,
+    remove_ip_block,
+    is_ip_blocked,
+    get_blocked_ips,
+    block_ip_from_incident,
+    export_blocklist,
+    BlockReason,
+    BlockStatus,
+)
 from app.integration.enhanced_prompt import build_enhanced_prompt_from_rows
 
 DEFAULT_DB_PATH = "./data/honeykey.db"
@@ -139,15 +150,8 @@ def init_db() -> None:
             )
             """
         )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS blocked_ips (
-                ip TEXT PRIMARY KEY,
-                blocked_at TEXT NOT NULL,
-                reason TEXT
-            )
-            """
-        )
+        # Initialize IP blocklist table (enhanced version)
+        init_blocklist_table(conn)
 
 
 @app.on_event("startup")
@@ -664,3 +668,166 @@ async def get_ai_report(incident_id: int) -> AIReportResponse:
         )
     payload = json.loads(row["report_json"])
     return AIReportResponse(**payload)
+
+
+# =============================================================================
+# IP BLOCKING ENDPOINTS
+# =============================================================================
+
+class BlockIPRequestModel(BaseModel):
+    """Request model for blocking an IP."""
+    ip_address: Optional[str] = None  # If None, use incident's source_ip
+    reason: str = "honeypot_abuse"
+    duration_hours: Optional[int] = 24  # None = permanent
+    notes: str = ""
+
+
+class BlockIPResponseModel(BaseModel):
+    """Response model for IP block operations."""
+    success: bool
+    message: str
+    block: Optional[dict] = None
+
+
+class BlocklistResponseModel(BaseModel):
+    """Response model for blocklist queries."""
+    total: int
+    blocks: List[dict]
+
+
+@app.post("/incidents/{incident_id}/block-ip", response_model=BlockIPResponseModel)
+async def block_incident_ip(incident_id: int, request: BlockIPRequestModel) -> BlockIPResponseModel:
+    """
+    Block the source IP from an incident.
+
+    This endpoint is called from the frontend when a user clicks
+    "Block IP" on an incident report.
+    """
+    with get_db() as conn:
+        result = block_ip_from_incident(
+            conn,
+            incident_id=incident_id,
+            blocked_by="analyst",
+            duration_hours=request.duration_hours,
+            notes=request.notes,
+        )
+        return BlockIPResponseModel(
+            success=result.success,
+            message=result.message,
+            block=result.block.to_dict() if result.block else None,
+        )
+
+
+@app.post("/blocklist", response_model=BlockIPResponseModel)
+async def add_to_blocklist(request: BlockIPRequestModel) -> BlockIPResponseModel:
+    """
+    Manually add an IP to the blocklist.
+
+    Used for blocking IPs that aren't associated with a specific incident.
+    """
+    if not request.ip_address:
+        raise HTTPException(status_code=400, detail="ip_address is required")
+
+    try:
+        reason = BlockReason(request.reason)
+    except ValueError:
+        reason = BlockReason.MANUAL
+
+    with get_db() as conn:
+        try:
+            block = add_ip_block(
+                conn,
+                ip_address=request.ip_address,
+                reason=reason,
+                blocked_by="analyst",
+                duration_hours=request.duration_hours,
+                notes=request.notes,
+            )
+            return BlockIPResponseModel(
+                success=True,
+                message=f"Successfully blocked IP {request.ip_address}",
+                block=block.to_dict(),
+            )
+        except ValueError as e:
+            return BlockIPResponseModel(
+                success=False,
+                message=str(e),
+            )
+
+
+@app.delete("/blocklist/{ip_address}", response_model=BlockIPResponseModel)
+async def remove_from_blocklist(ip_address: str) -> BlockIPResponseModel:
+    """Remove an IP from the blocklist."""
+    with get_db() as conn:
+        success = remove_ip_block(conn, ip_address=ip_address, removed_by="analyst")
+        if success:
+            return BlockIPResponseModel(
+                success=True,
+                message=f"Successfully unblocked IP {ip_address}",
+            )
+        return BlockIPResponseModel(
+            success=False,
+            message=f"IP {ip_address} is not currently blocked",
+        )
+
+
+@app.get("/blocklist", response_model=BlocklistResponseModel)
+async def list_blocklist(
+    status: Optional[str] = "active",
+    incident_id: Optional[int] = None,
+    limit: int = 100,
+) -> BlocklistResponseModel:
+    """
+    Get the current IP blocklist.
+
+    Query params:
+        status: Filter by status ('active', 'expired', 'removed', or None for all)
+        incident_id: Filter by incident
+        limit: Max results (default 100)
+    """
+    try:
+        block_status = BlockStatus(status) if status else None
+    except ValueError:
+        block_status = BlockStatus.ACTIVE
+
+    with get_db() as conn:
+        blocks = get_blocked_ips(conn, status=block_status, incident_id=incident_id, limit=limit)
+        return BlocklistResponseModel(
+            total=len(blocks),
+            blocks=[b.to_dict() for b in blocks],
+        )
+
+
+@app.get("/blocklist/check/{ip_address}")
+async def check_ip_blocked(ip_address: str) -> dict:
+    """Check if an IP is currently blocked."""
+    with get_db() as conn:
+        blocked = is_ip_blocked(conn, ip_address)
+        return {
+            "ip_address": ip_address,
+            "is_blocked": blocked,
+        }
+
+
+@app.get("/blocklist/export")
+async def export_blocklist_endpoint(format: str = "plain") -> Any:
+    """
+    Export the blocklist in various formats for firewall/WAF integration.
+
+    Formats:
+        plain: One IP per line
+        nginx: nginx deny directives
+        iptables: iptables DROP commands
+        json: JSON array of block objects
+    """
+    with get_db() as conn:
+        try:
+            content = export_blocklist(conn, format=format)
+            if format == "json":
+                return JSONResponse(content=json.loads(content))
+            return JSONResponse(
+                content={"format": format, "content": content},
+                media_type="application/json",
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
