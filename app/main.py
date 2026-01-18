@@ -1018,6 +1018,17 @@ async def api_list_reports() -> List[ReportListItem]:
             """
         ).fetchall()
 
+        def get_attack_title(key_id: str, source_ip: str) -> str:
+            """Generate descriptive title based on the honeypot key used."""
+            if key_id.startswith("acme_docker"):
+                return f"GitHub Credential Leak - {source_ip}"
+            elif key_id.startswith("acme_client"):
+                return f"Source Map Extraction Attack - {source_ip}"
+            elif key_id.startswith("acme_debug"):
+                return f"Debug Log Compromise - {source_ip}"
+            else:
+                return f"API Key Abuse Detected - {source_ip}"
+
         reports = []
         for inc in incidents:
             # Parse AI report if available
@@ -1037,7 +1048,7 @@ async def api_list_reports() -> List[ReportListItem]:
             reports.append(ReportListItem(
                 id=f"INC-{inc['id']:04d}",
                 incident_id=inc["id"],
-                title=f"Honeypot Activity - {inc['source_ip']}",
+                title=get_attack_title(inc["key_id"], inc["source_ip"]),
                 generated_date=inc["report_date"] or inc["last_seen"],
                 incident_date=inc["first_seen"],
                 severity=severity,
