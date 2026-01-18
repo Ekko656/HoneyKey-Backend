@@ -20,6 +20,21 @@ from .soc_enrichment import (
     format_evidence_from_metadata,
     generate_recommendations_from_metadata,
 )
+from .ip_blocking import (
+    IPBlock,
+    BlockReason,
+    BlockStatus,
+    BlockIPRequest,
+    BlockIPResponse,
+    BlocklistResponse,
+    init_blocklist_table,
+    add_ip_block,
+    remove_ip_block,
+    is_ip_blocked,
+    get_blocked_ips,
+    block_ip_from_incident,
+    export_blocklist,
+)
 
 __all__ = [
     "HONEYPOT_KEYS",
@@ -36,4 +51,18 @@ __all__ = [
     "build_enriched_soc_prompt",
     "format_evidence_from_metadata",
     "generate_recommendations_from_metadata",
+    # IP Blocking
+    "IPBlock",
+    "BlockReason",
+    "BlockStatus",
+    "BlockIPRequest",
+    "BlockIPResponse",
+    "BlocklistResponse",
+    "init_blocklist_table",
+    "add_ip_block",
+    "remove_ip_block",
+    "is_ip_blocked",
+    "get_blocked_ips",
+    "block_ip_from_incident",
+    "export_blocklist",
 ]

@@ -18,12 +18,31 @@ from .report_enrichment import (
     enrich_soc_report,
     merge_behavioral_analysis,
 )
+from .dual_reports import (
+    DualReport,
+    ExecutiveReport,
+    EngineerReport,
+    build_dual_report_prompt,
+    generate_dual_report,
+    generate_fallback_dual_report,
+    parse_dual_report_response,
+)
 
 __all__ = [
+    # Enhanced prompt
     "build_enhanced_prompt",
     "create_behavioral_context",
     "get_key_hint",
     "KeyHint",
+    # Report enrichment
     "enrich_soc_report",
     "merge_behavioral_analysis",
+    # Dual reports
+    "DualReport",
+    "ExecutiveReport",
+    "EngineerReport",
+    "build_dual_report_prompt",
+    "generate_dual_report",
+    "generate_fallback_dual_report",
+    "parse_dual_report_response",
 ]

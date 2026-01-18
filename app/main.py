@@ -11,11 +11,40 @@ from typing import Any, Generator, List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+from app.integration.enhanced_prompt import build_enhanced_prompt_from_rows
+from app.features.attacker_responses import (
+    get_fake_project_list,
+    get_fake_secret_list,
+    generate_request_id,
+    utc_now_iso,
+)
+
+from app.features.attacker_responses import (
+    generate_request_id,
+    get_fake_project_list,
+    get_fake_secret_list,
+    utc_now_iso,
+)
+from app.features.key_metadata import HONEYPOT_KEYS
+from app.features.ip_blocking import (
+    init_blocklist_table,
+    add_ip_block,
+    remove_ip_block,
+    is_ip_blocked,
+    get_blocked_ips,
+    block_ip_from_incident,
+    export_blocklist,
+    BlockReason,
+    BlockStatus,
+)
+from app.integration.enhanced_prompt import build_enhanced_prompt_from_rows
 
 DEFAULT_DB_PATH = "./data/honeykey.db"
 DEFAULT_INCIDENT_WINDOW_MINUTES = 30
-DEFAULT_GEMINI_MODEL = "gemini-1.5-pro"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 
 
 class Settings(BaseModel):
@@ -29,12 +58,23 @@ class Settings(BaseModel):
 
 def load_settings() -> Settings:
     load_dotenv()
-    cors_origins = [
+    # Default CORS origins for local development and production
+    default_origins = [
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "https://honeykey.tech",
+        "https://www.honeykey.tech",
+    ]
+    env_origins = [
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "").split(",")
         if origin.strip()
     ]
-    return Settings(
+    # Combine default and env origins, remove duplicates
+    cors_origins = list(set(default_origins + env_origins))
+    settings = Settings(
         database_path=os.getenv("DATABASE_PATH", DEFAULT_DB_PATH),
         honeypot_key=os.getenv("HONEYPOT_KEY", ""),
         incident_window_minutes=int(
@@ -44,6 +84,9 @@ def load_settings() -> Settings:
         gemini_api_key=os.getenv("GEMINI_API_KEY"),
         gemini_model=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
     )
+    print(f"DEBUG: Loaded Key: {(settings.gemini_api_key or '')[:10]}... Model: {settings.gemini_model}")
+    print(f"DEBUG: CORS Origins: {cors_origins}")
+    return settings
 
 
 settings = load_settings()
@@ -53,6 +96,7 @@ app = FastAPI(title="HoneyKey Backend")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins or [],
+    allow_origin_regex=r"https://.*\.vercel\.app",  # Allow Vercel preview deployments
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -120,6 +164,23 @@ def init_db() -> None:
             )
             """
         )
+        # Initialize IP blocklist table (enhanced version)
+        init_blocklist_table(conn)
+
+
+@app.middleware("http")
+async def block_ip_middleware(request: Request, call_next):
+    """Block requests from IPs in the blocklist. Returns ambiguous error."""
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        with get_db() as conn:
+            if is_ip_blocked(conn, client_ip):
+                # Ambiguous error - looks like a normal auth failure
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized"}
+                )
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -157,8 +218,10 @@ class HealthResponse(BaseModel):
 class AIReportResponse(BaseModel):
     incident_id: int
     severity: str
+    confidence_score: float
     summary: str
     evidence: List[str]
+    techniques: List[str]
     recommended_actions: List[str]
     report: Optional[str] = None
     techniques: Optional[List[str]] = None
@@ -192,7 +255,8 @@ def validate_report_payload(payload: dict, incident_id: int) -> AIReportResponse
         "recommended_actions",
     }
     if not required_keys.issubset(set(payload.keys())):
-        raise ValueError("Missing required JSON keys in report")
+        missing = required_keys - set(payload.keys())
+        raise ValueError(f"Missing required JSON keys in report: {missing}")
     if not isinstance(payload["incident_id"], int):
         raise ValueError("incident_id must be int")
     if payload["incident_id"] != incident_id:
@@ -209,17 +273,14 @@ def validate_report_payload(payload: dict, incident_id: int) -> AIReportResponse
         isinstance(item, str) for item in payload["recommended_actions"]
     ):
         raise ValueError("recommended_actions must be list of strings")
+    # Optional fields with defaults
+    if "confidence_score" not in payload:
+        payload["confidence_score"] = 0.8
+    if "techniques" not in payload:
+        payload["techniques"] = []
     if "report" in payload and payload["report"] is not None:
         if not isinstance(payload["report"], str):
             raise ValueError("report must be string")
-    if "techniques" in payload and payload["techniques"] is not None:
-        if not isinstance(payload["techniques"], list) or not all(
-            isinstance(item, str) for item in payload["techniques"]
-        ):
-            raise ValueError("techniques must be list of strings")
-    if "confidence_score" in payload and payload["confidence_score"] is not None:
-        if not isinstance(payload["confidence_score"], (int, float)):
-            raise ValueError("confidence_score must be number")
     return AIReportResponse(**payload)
 
 
@@ -383,18 +444,35 @@ def find_or_create_incident(conn: sqlite3.Connection, source_ip: str, key_id: st
 async def logging_middleware(request: Request, call_next) -> Any:
     correlation_id = request.headers.get("x-correlation-id") or str(uuid.uuid4())
     request.state.correlation_id = correlation_id
+    
     auth_header = request.headers.get("authorization")
     auth_present = bool(auth_header)
     token = parse_bearer_token(auth_header)
-    honeypot_key = get_settings().honeypot_key
-    honeypot_key_used = bool(token and honeypot_key and token == honeypot_key)
+
+    # Check against all honeypot keys (from registry + env)
+    honeypot_key_used = False
+    key_id = None
+    env_key = get_settings().honeypot_key
+
+    if token:
+        # Check env key first
+        if env_key and token == env_key:
+            honeypot_key_used = True
+            key_id = token  # Use actual token for identification logic
+        # Check all registered honeypot keys
+        elif token in HONEYPOT_KEYS:
+            honeypot_key_used = True
+            key_id = token  # Use the actual key as ID for tracking
+
+    request.state.honeypot_key_used = honeypot_key_used
+    request.state.key_id = key_id
+
+    client_ip = request.client.host if request.client else None
 
     response = await call_next(request)
     response.headers["x-correlation-id"] = correlation_id
 
     now_iso = utc_now().isoformat()
-    client_ip = request.client.host if request.client else None
-    key_id = "honeypot" if honeypot_key_used else None
     with get_db() as conn:
         incident_id = None
         if honeypot_key_used and client_ip:
@@ -429,17 +507,44 @@ async def health() -> HealthResponse:
 
 
 @app.get("/v1/projects")
-async def trap_projects() -> None:
+async def trap_projects(request: Request) -> Any:
+    # If the honeypot key was used, provide realistic fake data to keep them hooked
+    # Middleware already validated the key if request.state.auth_present is True
+    if getattr(request.state, "honeypot_key_used", False):
+        return {
+            "data": get_fake_project_list(),
+            "meta": {
+                "total": 4,
+                "request_id": generate_request_id(),
+                "timestamp": utc_now_iso(),
+            }
+        }
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @app.get("/v1/secrets")
-async def trap_secrets() -> None:
+async def trap_secrets(request: Request) -> Any:
+    if getattr(request.state, "honeypot_key_used", False):
+         return {
+            "data": get_fake_secret_list(),
+            "meta": {
+                "total": 5,
+                "request_id": generate_request_id(),
+                "timestamp": utc_now_iso(),
+            }
+        }
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @app.post("/v1/auth/verify")
-async def trap_verify() -> None:
+async def trap_verify(request: Request) -> Any:
+    if getattr(request.state, "honeypot_key_used", False):
+        return {
+            "valid": True,
+            "scopes": ["read", "write", "admin"],
+            "expires_in": 3600,
+            "meta": {"request_id": generate_request_id()}
+        }
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -528,43 +633,76 @@ async def analyze_incident(incident_id: int, request: Request) -> AIReportRespon
             (incident_id,),
         ).fetchall()
 
-    prompt = build_prompt(incident, events)
+    # Use the actual key_id from the incident (which is the full key value for registered keys)
+    incident_key = incident["key_id"]
+    prompt = build_enhanced_prompt_from_rows(incident, events, key_value=incident_key)
     correlation_id = getattr(request.state, "correlation_id", "unknown")
     response_text = ""
     provider = "gemini"
     try:
-        response_text = generate_gemini_report(
-            prompt,
-            settings_value.gemini_api_key,
-            settings_value.gemini_model,
-        )
-        payload = extract_json_payload(response_text)
-        report = validate_report_payload(payload, incident_id)
-        report = report.model_copy(
-            update={
-                "recommended_actions": normalize_recommended_actions(
-                    report.recommended_actions
-                )
-            }
-        )
+        try:
+            response_text = generate_gemini_report(
+                prompt,
+                settings_value.gemini_api_key,
+                settings_value.gemini_model,
+            )
+            payload = extract_json_payload(response_text)
+            report = validate_report_payload(payload, incident_id)
+            report = report.model_copy(
+                update={
+                    "recommended_actions": normalize_recommended_actions(
+                        report.recommended_actions
+                    )
+                }
+            )
+        except Exception as ai_exc:
+            # Fallback to deterministic report if AI fails (Rate limits, etc)
+            print(f"WARNING: AI Generation failed ({ai_exc}). Using fallback report.")
+            response_text = f"FALLBACK: {str(ai_exc)}"
+            fallback_text = build_report_fallback(incident, events)
+            report = AIReportResponse(
+                incident_id=incident_id,
+                severity="Medium",
+                confidence_score=1.0,
+                summary="AI generation unavailable (Rate Limit/Error). Showing telemetry summary.",
+                evidence=["Deterministic fallback triggered"],
+                techniques=["T1000: Fallback Technique"],
+                recommended_actions=["Check API Quota"],
+                report=fallback_text
+            )
+
         if not report.report:
             report_text = build_report_fallback(incident, events)
             report = report.model_copy(update={"report": report_text})
+
     except Exception as exc:
+        print(f"CRITICAL AI ERROR: {exc}. Generating Fallback.")
+        fallback_map = {
+             "acme_docker_j4k5l6m7n8o9p0q1": ("GitHub Credential Leak", "high"),
+             "acme_client_m5n6o7p8q9r0s1t2": ("Source Map Extraction", "medium"),
+             "acme_debug_a1b2c3d4e5f6g7h8": ("Debug Log Exposure", "high")
+        }
+        fb_summ, fb_sev = fallback_map.get(incident_key, ("Honeypot Key Abuse Detected", "medium"))
+
+        fallback_report = AIReportResponse(
+            incident_id=incident_id,
+            severity=fb_sev,
+            confidence_score=1.0,
+            summary=f"Analysis Unavailable: {fb_summ}. (Fallback Mode)",
+            evidence=["Manual Fallback Triggered", f"Error: {str(exc)}"],
+            techniques=["T1000: Fallback"],
+            recommended_actions=["Check Gemini Quota", "Revoke Key"],
+            report=f"**FALLBACK REPORT**\n\nAI Analysis failed. Using deterministic fallback.\nSummary: {fb_summ}"
+        )
         with get_db() as conn:
-            store_ai_report(
-                conn,
-                incident_id,
-                provider,
-                settings_value.gemini_model,
-                response_text or None,
-                False,
-                str(exc),
-            )
+            store_ai_report(conn, incident_id, "fallback", "fallback", fallback_report.model_dump_json(), True, str(exc))
+        return fallback_report
+
+        # If even fallback fails, then raise error
         raise HTTPException(
             status_code=502,
             detail=(
-                "Failed to parse AI report. "
+                f"Reporting failed: {str(exc)}. "
                 f"correlation_id={correlation_id}"
             ),
         ) from exc
@@ -603,3 +741,495 @@ async def get_ai_report(incident_id: int) -> AIReportResponse:
         )
     payload = json.loads(row["report_json"])
     return AIReportResponse(**payload)
+
+
+# =============================================================================
+# IP BLOCKING ENDPOINTS
+# =============================================================================
+
+class BlockIPRequestModel(BaseModel):
+    """Request model for blocking an IP."""
+    ip_address: Optional[str] = None  # If None, use incident's source_ip
+    reason: str = "honeypot_abuse"
+    duration_hours: Optional[int] = 24  # None = permanent
+    notes: str = ""
+
+
+class BlockIPResponseModel(BaseModel):
+    """Response model for IP block operations."""
+    success: bool
+    message: str
+    block: Optional[dict] = None
+
+
+class BlocklistResponseModel(BaseModel):
+    """Response model for blocklist queries."""
+    total: int
+    blocks: List[dict]
+
+
+@app.post("/incidents/{incident_id}/block-ip", response_model=BlockIPResponseModel)
+async def block_incident_ip(incident_id: int, request: BlockIPRequestModel) -> BlockIPResponseModel:
+    """
+    Block the source IP from an incident.
+
+    This endpoint is called from the frontend when a user clicks
+    "Block IP" on an incident report.
+    """
+    with get_db() as conn:
+        result = block_ip_from_incident(
+            conn,
+            incident_id=incident_id,
+            blocked_by="analyst",
+            duration_hours=request.duration_hours,
+            notes=request.notes,
+        )
+        return BlockIPResponseModel(
+            success=result.success,
+            message=result.message,
+            block=result.block.to_dict() if result.block else None,
+        )
+
+
+@app.delete("/incidents/{incident_id}/unblock-ip", response_model=BlockIPResponseModel)
+async def unblock_incident_ip(incident_id: int) -> BlockIPResponseModel:
+    """
+    Unblock the source IP from an incident.
+
+    Called when user clicks "Unblock IP" on an incident report.
+    """
+    with get_db() as conn:
+        incident = conn.execute(
+            "SELECT source_ip FROM incidents WHERE id = ?",
+            (incident_id,)
+        ).fetchone()
+
+        if not incident:
+            return BlockIPResponseModel(success=False, message=f"Incident {incident_id} not found")
+
+        source_ip = incident["source_ip"]
+        success = remove_ip_block(conn, ip_address=source_ip, removed_by="analyst")
+
+        if success:
+            return BlockIPResponseModel(success=True, message=f"Successfully unblocked IP {source_ip}")
+        return BlockIPResponseModel(success=False, message=f"IP {source_ip} is not currently blocked")
+
+
+@app.get("/incidents/{incident_id}/block-status")
+async def get_incident_block_status(incident_id: int) -> dict:
+    """Check if the incident's source IP is currently blocked."""
+    with get_db() as conn:
+        incident = conn.execute(
+            "SELECT source_ip FROM incidents WHERE id = ?", (incident_id,)
+        ).fetchone()
+
+        if not incident:
+            raise HTTPException(status_code=404, detail="Incident not found")
+
+        source_ip = incident["source_ip"]
+        blocked = is_ip_blocked(conn, source_ip)
+
+        return {"incident_id": incident_id, "source_ip": source_ip, "is_blocked": blocked}
+
+
+@app.post("/blocklist", response_model=BlockIPResponseModel)
+async def add_to_blocklist(request: BlockIPRequestModel) -> BlockIPResponseModel:
+    """
+    Manually add an IP to the blocklist.
+
+    Used for blocking IPs that aren't associated with a specific incident.
+    """
+    if not request.ip_address:
+        raise HTTPException(status_code=400, detail="ip_address is required")
+
+    try:
+        reason = BlockReason(request.reason)
+    except ValueError:
+        reason = BlockReason.MANUAL
+
+    with get_db() as conn:
+        try:
+            block = add_ip_block(
+                conn,
+                ip_address=request.ip_address,
+                reason=reason,
+                blocked_by="analyst",
+                duration_hours=request.duration_hours,
+                notes=request.notes,
+            )
+            return BlockIPResponseModel(
+                success=True,
+                message=f"Successfully blocked IP {request.ip_address}",
+                block=block.to_dict(),
+            )
+        except ValueError as e:
+            return BlockIPResponseModel(
+                success=False,
+                message=str(e),
+            )
+
+
+@app.delete("/blocklist/{ip_address}", response_model=BlockIPResponseModel)
+async def remove_from_blocklist(ip_address: str) -> BlockIPResponseModel:
+    """Remove an IP from the blocklist."""
+    with get_db() as conn:
+        success = remove_ip_block(conn, ip_address=ip_address, removed_by="analyst")
+        if success:
+            return BlockIPResponseModel(
+                success=True,
+                message=f"Successfully unblocked IP {ip_address}",
+            )
+        return BlockIPResponseModel(
+            success=False,
+            message=f"IP {ip_address} is not currently blocked",
+        )
+
+
+@app.get("/blocklist", response_model=BlocklistResponseModel)
+async def list_blocklist(
+    status: Optional[str] = "active",
+    incident_id: Optional[int] = None,
+    limit: int = 100,
+) -> BlocklistResponseModel:
+    """
+    Get the current IP blocklist.
+
+    Query params:
+        status: Filter by status ('active', 'expired', 'removed', or None for all)
+        incident_id: Filter by incident
+        limit: Max results (default 100)
+    """
+    try:
+        block_status = BlockStatus(status) if status else None
+    except ValueError:
+        block_status = BlockStatus.ACTIVE
+
+    with get_db() as conn:
+        blocks = get_blocked_ips(conn, status=block_status, incident_id=incident_id, limit=limit)
+        return BlocklistResponseModel(
+            total=len(blocks),
+            blocks=[b.to_dict() for b in blocks],
+        )
+
+
+@app.get("/blocklist/check/{ip_address}")
+async def check_ip_blocked(ip_address: str) -> dict:
+    """Check if an IP is currently blocked."""
+    with get_db() as conn:
+        blocked = is_ip_blocked(conn, ip_address)
+        return {
+            "ip_address": ip_address,
+            "is_blocked": blocked,
+        }
+
+
+@app.get("/blocklist/export")
+async def export_blocklist_endpoint(format: str = "plain") -> Any:
+    """
+    Export the blocklist in various formats for firewall/WAF integration.
+
+    Formats:
+        plain: One IP per line
+        nginx: nginx deny directives
+        iptables: iptables DROP commands
+        json: JSON array of block objects
+    """
+    with get_db() as conn:
+        try:
+            content = export_blocklist(conn, format=format)
+            if format == "json":
+                return JSONResponse(content=json.loads(content))
+            return JSONResponse(
+                content={"format": format, "content": content},
+                media_type="application/json",
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+
+# =============================================================================
+# FRONTEND API COMPATIBILITY ROUTES (/api/*)
+# These routes provide a clean /api/* prefix for frontend integration
+# =============================================================================
+
+class DashboardStats(BaseModel):
+    """Dashboard statistics for the frontend."""
+    active_incidents: int
+    total_incidents: int
+    honeypot_keys_active: int
+    blocked_ips: int
+    last_incident_time: Optional[str]
+
+
+class ReportListItem(BaseModel):
+    """Report list item for frontend."""
+    id: str
+    incident_id: int
+    title: str
+    generated_date: str
+    incident_date: str
+    severity: str
+    status: str
+    event_count: int
+    source_ip: str
+    summary: str
+
+
+@app.get("/api/dashboard/stats", response_model=DashboardStats)
+async def api_dashboard_stats() -> DashboardStats:
+    """Get dashboard statistics for the frontend."""
+    with get_db() as conn:
+        # Count total incidents
+        total = conn.execute("SELECT COUNT(*) as cnt FROM incidents").fetchone()["cnt"]
+
+        # Get most recent incident
+        last_incident = conn.execute(
+            "SELECT last_seen FROM incidents ORDER BY last_seen DESC LIMIT 1"
+        ).fetchone()
+
+        # Count active blocked IPs
+        blocked = conn.execute(
+            "SELECT COUNT(*) as cnt FROM ip_blocklist WHERE status = 'active'"
+        ).fetchone()["cnt"]
+
+        # Count incidents in last 24 hours as "active"
+        yesterday = (utc_now() - timedelta(hours=24)).isoformat()
+        active = conn.execute(
+            "SELECT COUNT(*) as cnt FROM incidents WHERE last_seen >= ?",
+            (yesterday,)
+        ).fetchone()["cnt"]
+
+        return DashboardStats(
+            active_incidents=active,
+            total_incidents=total,
+            honeypot_keys_active=12,  # Configurable in production
+            blocked_ips=blocked,
+            last_incident_time=last_incident["last_seen"] if last_incident else None,
+        )
+
+
+@app.get("/api/reports", response_model=List[ReportListItem])
+async def api_list_reports() -> List[ReportListItem]:
+    """
+    List all incidents as reports for the frontend.
+    Maps incidents to the report format expected by the frontend.
+    """
+    with get_db() as conn:
+        incidents = conn.execute(
+            """
+            SELECT i.id, i.key_id, i.source_ip, i.first_seen, i.last_seen, i.event_count,
+                   ar.report_json, ar.created_at as report_date
+            FROM incidents i
+            LEFT JOIN (
+                SELECT incident_id, report_json, created_at,
+                       ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY created_at DESC) as rn
+                FROM ai_reports
+                WHERE parse_ok = 1
+            ) ar ON ar.incident_id = i.id AND ar.rn = 1
+            ORDER BY i.last_seen DESC
+            """
+        ).fetchall()
+
+        def get_attack_title(key_id: str, source_ip: str) -> str:
+            """Generate descriptive title based on the honeypot key used."""
+            if key_id.startswith("acme_docker"):
+                return f"GitHub Credential Leak - {source_ip}"
+            elif key_id.startswith("acme_client"):
+                return f"Source Map Extraction Attack - {source_ip}"
+            elif key_id.startswith("acme_debug"):
+                return f"Debug Log Compromise - {source_ip}"
+            else:
+                return f"API Key Abuse Detected - {source_ip}"
+
+        reports = []
+        for inc in incidents:
+            # Parse AI report if available
+            severity = "medium"
+            summary = f"Honeypot key usage detected from {inc['source_ip']}"
+            status = "new"
+
+            if inc["report_json"]:
+                try:
+                    report_data = json.loads(inc["report_json"])
+                    severity = report_data.get("severity", "medium").lower()
+                    summary = report_data.get("summary", summary)
+                    status = "reviewed"
+                except:
+                    pass
+
+            reports.append(ReportListItem(
+                id=f"INC-{inc['id']:04d}",
+                incident_id=inc["id"],
+                title=get_attack_title(inc["key_id"], inc["source_ip"]),
+                generated_date=inc["report_date"] or inc["last_seen"],
+                incident_date=inc["first_seen"],
+                severity=severity,
+                status=status,
+                event_count=inc["event_count"],
+                source_ip=inc["source_ip"],
+                summary=summary,
+            ))
+
+        return reports
+
+
+@app.get("/api/reports/{report_id}")
+async def api_get_report(report_id: str) -> dict:
+    """
+    Get a specific report by ID (format: INC-XXXX).
+    Returns full report details including AI analysis.
+    """
+    # Parse incident ID from report ID
+    try:
+        incident_id = int(report_id.replace("INC-", ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid report ID format")
+
+    with get_db() as conn:
+        # Get incident
+        incident = conn.execute(
+            """
+            SELECT id, key_id, source_ip, first_seen, last_seen, event_count
+            FROM incidents WHERE id = ?
+            """,
+            (incident_id,)
+        ).fetchone()
+
+        if not incident:
+            raise HTTPException(status_code=404, detail="Report not found")
+
+        # Get AI report if available
+        ai_report = conn.execute(
+            """
+            SELECT report_json, created_at, parse_ok
+            FROM ai_reports
+            WHERE incident_id = ? AND parse_ok = 1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (incident_id,)
+        ).fetchone()
+
+        # Get events
+        events = conn.execute(
+            """
+            SELECT id, ts, ip, method, path, user_agent, correlation_id,
+                   auth_present, honeypot_key_used
+            FROM events
+            WHERE incident_id = ?
+            ORDER BY ts DESC
+            LIMIT 50
+            """,
+            (incident_id,)
+        ).fetchall()
+
+        # Get block status
+        blocked = is_ip_blocked(conn, incident["source_ip"])
+
+        # Build response
+        report_data = None
+        if ai_report and ai_report["report_json"]:
+            try:
+                report_data = json.loads(ai_report["report_json"])
+            except:
+                pass
+
+        return {
+            "id": f"INC-{incident['id']:04d}",
+            "incident_id": incident["id"],
+            "source_ip": incident["source_ip"],
+            "key_id": incident["key_id"],
+            "first_seen": incident["first_seen"],
+            "last_seen": incident["last_seen"],
+            "event_count": incident["event_count"],
+            "is_blocked": blocked,
+            "has_ai_report": report_data is not None,
+            "ai_report": report_data,
+            "events": [
+                {
+                    "id": e["id"],
+                    "timestamp": e["ts"],
+                    "ip": e["ip"],
+                    "method": e["method"],
+                    "path": e["path"],
+                    "user_agent": e["user_agent"],
+                    "correlation_id": e["correlation_id"],
+                }
+                for e in events
+            ],
+        }
+
+
+@app.get("/api/reports/{report_id}/events")
+async def api_get_report_events(report_id: str, limit: int = 50) -> List[dict]:
+    """Get events for a specific report."""
+    try:
+        incident_id = int(report_id.replace("INC-", ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid report ID format")
+
+    with get_db() as conn:
+        events = conn.execute(
+            """
+            SELECT id, ts, ip, method, path, user_agent, correlation_id,
+                   auth_present, honeypot_key_used
+            FROM events
+            WHERE incident_id = ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            (incident_id, limit),
+        ).fetchall()
+
+        return [
+            {
+                "id": e["id"],
+                "timestamp": e["ts"],
+                "ip": e["ip"],
+                "method": e["method"],
+                "path": e["path"],
+                "user_agent": e["user_agent"],
+                "correlation_id": e["correlation_id"],
+                "auth_present": bool(e["auth_present"]),
+                "honeypot_key_used": bool(e["honeypot_key_used"]),
+            }
+            for e in events
+        ]
+
+
+@app.post("/api/reports/{report_id}/analyze")
+async def api_analyze_report(report_id: str, request: Request) -> dict:
+    """
+    Trigger AI analysis for a report.
+    This is an alias to the existing /incidents/{id}/analyze endpoint.
+    """
+    try:
+        incident_id = int(report_id.replace("INC-", ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid report ID format")
+
+    # Use existing analyze function
+    result = await analyze_incident(incident_id, request)
+    return result.model_dump()
+
+
+@app.post("/api/reports/{report_id}/block-ip")
+async def api_block_report_ip(report_id: str, request: BlockIPRequestModel) -> BlockIPResponseModel:
+    """Block the IP associated with a report."""
+    try:
+        incident_id = int(report_id.replace("INC-", ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid report ID format")
+
+    return await block_incident_ip(incident_id, request)
+
+
+@app.delete("/api/reports/{report_id}/unblock-ip")
+async def api_unblock_report_ip(report_id: str) -> BlockIPResponseModel:
+    """Unblock the IP associated with a report."""
+    try:
+        incident_id = int(report_id.replace("INC-", ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid report ID format")
+
+    return await unblock_incident_ip(incident_id)

@@ -64,41 +64,70 @@ class KeyHint:
 # =============================================================================
 
 KEY_HINTS: dict[str, KeyHint] = {
-    # Client-side JS exposure
+    # Client-side JS exposure (full key and prefix)
+    "acme_client_m5n6o7p8q9r0s1t2": KeyHint(
+        key_prefix="acme_client_",
+        likely_leak_source="client-side JavaScript bundle with source maps",
+        suggested_discovery_method="source map extraction or JS analysis",
+        confidence_modifier=0.1,  # Slight boost if behavior matches
+        hint_text=(
+            "This key was planted in client-side JavaScript (dist/app.min.js with source map). "
+            "If the attacker found it there, they likely have intermediate technical skills "
+            "(source map parsing, understanding of JS build tooling). MITRE: T1552.001 "
+            "(Unsecured Credentials: Credentials In Files)."
+        ),
+    ),
     "acme_client_": KeyHint(
         key_prefix="acme_client_",
         likely_leak_source="client-side JavaScript",
         suggested_discovery_method="source map extraction or JS analysis",
-        confidence_modifier=0.1,  # Slight boost if behavior matches
+        confidence_modifier=0.1,
         hint_text=(
-            "This key was planted in client-side JavaScript. If the attacker "
-            "found it there, they likely have intermediate technical skills "
-            "(source map parsing). However, the key could have been shared "
-            "or leaked through other means."
+            "This key was planted in client-side JavaScript. Indicates intermediate "
+            "technical skills if found via source map parsing."
         ),
     ),
-    # Debug log exposure
+    # Debug log exposure (full key and prefix)
+    "acme_debug_a1b2c3d4e5f6g7h8": KeyHint(
+        key_prefix="acme_debug_",
+        likely_leak_source="application debug logs (/var/log/acme/debug.log)",
+        suggested_discovery_method="log file access or log aggregation compromise",
+        confidence_modifier=0.15,  # Higher modifier - log access is significant
+        hint_text=(
+            "This key was planted in application debug logs. If found there, it suggests "
+            "the attacker has SYSTEM ACCESS (serious security breach). This is HIGH severity "
+            "as it indicates prior foothold. MITRE: T1552.001 + T1083 (File Discovery)."
+        ),
+    ),
     "acme_debug_": KeyHint(
         key_prefix="acme_debug_",
         likely_leak_source="application debug logs",
         suggested_discovery_method="log file access or log aggregation compromise",
-        confidence_modifier=0.15,  # Higher modifier - log access is significant
+        confidence_modifier=0.15,
         hint_text=(
-            "This key was planted in debug logs. If found there, it suggests "
-            "the attacker has system access (serious). However, the key could "
-            "have been extracted from a log export, backup, or shared externally."
+            "This key was planted in debug logs. Suggests system access if found there."
         ),
     ),
-    # Docker/infrastructure exposure
+    # Docker/infrastructure exposure (full key and prefix)
+    "acme_docker_j4k5l6m7n8o9p0q1": KeyHint(
+        key_prefix="acme_docker_",
+        likely_leak_source="docker-compose.yml in public GitHub repository",
+        suggested_discovery_method="GitHub dorking or automated repository scanning",
+        confidence_modifier=0.05,  # Low modifier - very common attack vector
+        hint_text=(
+            "This key was planted in docker-compose.yml committed to a public repo. "
+            "GitHub dorking is a NOVICE-level technique with automated tools (truffleHog). "
+            "Low sophistication but still indicates active reconnaissance. "
+            "MITRE: T1552.004 + T1593.003 (Search Code Repositories)."
+        ),
+    ),
     "acme_docker_": KeyHint(
         key_prefix="acme_docker_",
         likely_leak_source="infrastructure config (docker-compose, env files)",
         suggested_discovery_method="GitHub dorking or repository scanning",
-        confidence_modifier=0.05,  # Low modifier - very common attack vector
+        confidence_modifier=0.05,
         hint_text=(
-            "This key was planted in infrastructure config files. GitHub dorking "
-            "is a common, low-skill technique. The key could also have been found "
-            "in documentation, shared configs, or container registries."
+            "This key was planted in infrastructure config files. Common, low-skill technique."
         ),
     ),
 }
@@ -120,7 +149,11 @@ def get_key_hint(key_value: Optional[str]) -> Optional[KeyHint]:
     if not key_value:
         return None
 
-    # Match by prefix
+    # Check for exact match first (full key values)
+    if key_value in KEY_HINTS:
+        return KEY_HINTS[key_value]
+
+    # Then match by prefix
     for prefix, hint in KEY_HINTS.items():
         if key_value.startswith(prefix):
             return hint
@@ -234,14 +267,18 @@ Generate a JSON report with this exact structure:
 {{
     "incident_id": {incident_id},
     "severity": "Low|Medium|High|Critical",
+    "confidence_score": 0.0-1.0,
     "summary": "2-3 sentence executive summary",
     "evidence": ["evidence point 1", "evidence point 2", ...],
+    "techniques": ["Technique ID: Name", ...],
     "recommended_actions": ["action 1", "action 2", ...]
 }}
 
 Rules:
 - severity should match the behavioral risk level
+- confidence_score should reflect certainty in the attribution (float)
 - evidence should cite SPECIFIC behavioral observations
+- techniques should list MITRE ATT&CK techniques inferred from behavior (e.g. "T1595: Active Scanning")
 - recommended_actions should be actionable and specific
 - Return ONLY valid JSON, no markdown or code fences
 
@@ -396,7 +433,7 @@ def build_enhanced_prompt_from_rows(
             "method": row["method"],
             "path": row["path"],
             "user_agent": row["user_agent"],
-            "correlation_id": row.get("correlation_id"),
+            "correlation_id": row["correlation_id"],
             "auth_present": bool(row["auth_present"]),
             "honeypot_key_used": bool(row["honeypot_key_used"]),
         }

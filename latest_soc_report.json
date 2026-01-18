@@ -1,0 +1,17 @@
+{
+  "incident_id": 1,
+  "severity": "Medium",
+  "summary": "An unauthorized entity utilized a known honeypot credential ('honeypot') to perform reconnaissance and repeated API access attempts (60 events) against sensitive endpoints including '/v1/users', '/v1/projects', and '/admin'. All activity was successfully contained within the honeypot environment, but confirms active probing.",
+  "evidence": [
+    "Source IP 127.0.0.1 engaged in 60 events over approximately 30 minutes (02:41 to 03:12 UTC).",
+    "All recorded events logged 'honeypot_key_used: true', confirming the attacker used compromised or leaked canary credentials.",
+    "The attacker systematically probed endpoints using automated methods (User-Agent: python-requests/2.32.5), specifically targeting resource lists (GET /v1/users, GET /v1/projects) and attempting administrative access (GET /admin).",
+    "The actor attempted data modification/creation via POST requests to /v1/projects."
+  ],
+  "recommended_actions": [
+    "Investigate the origin of the Source IP 127.0.0.1 to determine if this traffic originates from an internal host or a misconfigured external proxy/logging environment.",
+    "Analyze the exposure vector of the 'honeypot' key to understand how the actor obtained the credential.",
+    "Review related logs for activity outside the honeypot environment using the same IP or credential pattern.",
+    "Extract full session data for inclusion in internal threat intelligence feeds."
+  ]
+}
