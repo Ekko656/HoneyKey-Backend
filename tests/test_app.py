@@ -21,7 +21,8 @@ def create_client(tmp_path):
     if "app.main" in sys.modules:
         del sys.modules["app.main"]
     module = importlib.import_module("app.main")
-    module.app.state.settings = module.load_settings()
+    module.settings = module.load_settings()
+    module.app.state.settings = module.settings
     module.init_db()
     return TestClient(module.app), db_path, module
 
