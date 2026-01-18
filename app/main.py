@@ -43,7 +43,7 @@ from app.integration.enhanced_prompt import build_enhanced_prompt_from_rows
 
 DEFAULT_DB_PATH = "./data/honeykey.db"
 DEFAULT_INCIDENT_WINDOW_MINUTES = 30
-DEFAULT_GEMINI_MODEL = "gemini-1.5-pro"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 
 
 class Settings(BaseModel):
@@ -626,23 +626,41 @@ async def analyze_incident(incident_id: int, request: Request) -> AIReportRespon
     response_text = ""
     provider = "gemini"
     try:
-        response_text = generate_gemini_report(
-            prompt,
-            settings_value.gemini_api_key,
-            settings_value.gemini_model,
-        )
-        payload = extract_json_payload(response_text)
-        report = validate_report_payload(payload, incident_id)
-        report = report.model_copy(
-            update={
-                "recommended_actions": normalize_recommended_actions(
-                    report.recommended_actions
-                )
-            }
-        )
+        try:
+            response_text = generate_gemini_report(
+                prompt,
+                settings_value.gemini_api_key,
+                settings_value.gemini_model,
+            )
+            payload = extract_json_payload(response_text)
+            report = validate_report_payload(payload, incident_id)
+            report = report.model_copy(
+                update={
+                    "recommended_actions": normalize_recommended_actions(
+                        report.recommended_actions
+                    )
+                }
+            )
+        except Exception as ai_exc:
+            # Fallback to deterministic report if AI fails (Rate limits, etc)
+            print(f"WARNING: AI Generation failed ({ai_exc}). Using fallback report.")
+            response_text = f"FALLBACK: {str(ai_exc)}"
+            fallback_text = build_report_fallback(incident, events)
+            report = AIReportResponse(
+                incident_id=incident_id,
+                severity="Medium",
+                confidence_score=1.0,
+                summary="AI generation unavailable (Rate Limit/Error). Showing telemetry summary.",
+                evidence=["Deterministic fallback triggered"],
+                techniques=["T1000: Fallback Technique"],
+                recommended_actions=["Check API Quota"],
+                report=fallback_text
+            )
+
         if not report.report:
             report_text = build_report_fallback(incident, events)
             report = report.model_copy(update={"report": report_text})
+
     except Exception as exc:
         with get_db() as conn:
             store_ai_report(
@@ -654,10 +672,11 @@ async def analyze_incident(incident_id: int, request: Request) -> AIReportRespon
                 False,
                 str(exc),
             )
+        # If even fallback fails, then raise error
         raise HTTPException(
             status_code=502,
             detail=(
-                f"AI Generation failed: {str(exc)}. "
+                f"Reporting failed: {str(exc)}. "
                 f"correlation_id={correlation_id}"
             ),
         ) from exc
