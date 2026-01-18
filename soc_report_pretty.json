@@ -1,0 +1,17 @@
+{
+  "incident_id": 1,
+  "severity": "Medium",
+  "summary": "Unauthorized reconnaissance activity was detected utilizing a known honeypot authentication key. An entity originating from 127.0.0.1 made three rapid API requests targeting sensitive endpoints (e.g., /v1/secrets, /v1/projects) using cURL. The immediate triggering of the honeypot mechanism successfully contained the intrusion attempt.",
+  "evidence": [
+    "Source IP 127.0.0.1 performed 3 requests in under 50 milliseconds.",
+    "All requests utilized an authentication token identified as a 'honeypot' key.",
+    "Endpoints targeted included /v1/projects and /v1/secrets, indicative of enumeration attempts.",
+    "User Agent identified as curl/8.7.1."
+  ],
+  "recommended_actions": [
+    "Review logging infrastructure to identify the host mapping to the 127.0.0.1 source IP, if proxied.",
+    "Analyze logs to determine how the honeypot key was exposed or tested.",
+    "Monitor the source IP for any subsequent activity or attempts to use other credentials.",
+    "Conduct a threat hunt for similar reconnaissance patterns across production environments."
+  ]
+}
