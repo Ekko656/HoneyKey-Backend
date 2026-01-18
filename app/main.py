@@ -156,14 +156,15 @@ def init_db() -> None:
 
 @app.middleware("http")
 async def block_ip_middleware(request: Request, call_next):
-    """Block requests from IPs in the blocklist. Returns 403 if IP is blocked."""
+    """Block requests from IPs in the blocklist. Returns ambiguous error."""
     client_ip = request.client.host if request.client else None
     if client_ip:
         with get_db() as conn:
             if is_ip_blocked(conn, client_ip):
+                # Ambiguous error - looks like a normal auth failure
                 return JSONResponse(
-                    status_code=403,
-                    content={"detail": "Access denied", "blocked": True}
+                    status_code=401,
+                    content={"detail": "Unauthorized"}
                 )
     return await call_next(request)
 
